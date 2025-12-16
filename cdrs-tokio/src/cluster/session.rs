@@ -470,6 +470,69 @@ impl<
         self.prepare_tw(query, None, false, false, false).await
     }
 
+    /// Prepare given CQL on all known nodes. Returns vector of results per node address.
+    /// This is useful when the user wants to ensure prepared statement exists on every node
+    /// (for example before batching prepared ids across nodes).
+    pub async fn prepare_on_all_nodes<Q: ToString>(
+        &self,
+        query: Q,
+        keyspace: Option<String>,
+    ) -> error::Result<PreparedQuery> {
+        let flags = prepare_flags(false, false, false);
+        let envelope = Envelope::new_req_prepare(query.to_string(), keyspace, flags, self.version);
+
+        // collect unignored nodes
+        let nodes = self.cluster_metadata_manager.metadata().unignored_nodes();
+
+        let mut first_error = None;
+        let mut prepared_query = None;
+        for node in nodes {
+            let addr = node.broadcast_rpc_address();
+
+            let res = send_envelope(
+                [node].iter().cloned(),
+                &envelope,
+                true,
+                self.retry_policy.as_ref().new_session(),
+            )
+            .await
+            .unwrap_or_else(|| Err("No response for prepare on node".into()))
+            .and_then(|response| response.response_body())
+            .and_then(convert_to_prepared);
+            match res {
+                Ok(prepared_res) => {
+                    debug!("Prepared statement on node {}", addr);
+                    if prepared_query.is_none() {
+                        prepared_query = Some(PreparedQuery {
+                            id: prepared_res.id,
+                            query: query.to_string(),
+                            keyspace: prepared_res
+                                .metadata
+                                .global_table_spec
+                                .map(|TableSpec { ks_name, .. }| ks_name),
+                            pk_indexes: prepared_res.metadata.pk_indexes,
+                            result_metadata_id: ArcSwapOption::new(
+                                prepared_res.result_metadata_id.map(Arc::new),
+                            ),
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to prepare statement on node {}: {}", addr, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => prepared_query.ok_or_else(|| {
+                error::Error::from("No nodes available to prepare the statement on!")
+            }),
+        }
+    }
+
     /// Executes batch query.
     #[inline]
     pub async fn batch(&self, batch: QueryBatch) -> error::Result<Envelope> {

@@ -306,24 +306,16 @@ impl<
                         ))
                     })?;
 
-                let prepare_envelope = Envelope::new_req_prepare(
-                    prepared.query.clone(),
-                    keyspace.map(|keyspace| keyspace.to_string()),
-                    flags,
-                    self.version,
-                );
-
-                let retry_policy = self.effective_retry_policy(parameters.retry_policy.as_ref());
-                let prepare_result = send_envelope(
-                    [node].iter().cloned(),
-                    &prepare_envelope,
-                    true,
-                    retry_policy.new_session(),
-                )
-                .await
-                .unwrap_or_else(|| Err("No response for re-prepare statement!".into()))
-                .and_then(|response| response.response_body())
-                .and_then(convert_to_prepared);
+                let prepare_result = self
+                    .prepare_raw_tw(
+                        prepared.query.clone(),
+                        keyspace.map(|keyspace| keyspace.to_string()),
+                        parameters.tracing,
+                        parameters.warnings,
+                        parameters.beta_protocol,
+                        Some([node].into()),
+                    )
+                    .await;
 
                 if let Ok(new) = prepare_result {
                     // re-prepare the statement and check the resulting id - it should remain the
@@ -418,13 +410,27 @@ impl<
         with_tracing: bool,
         with_warnings: bool,
         beta_protocol: bool,
+        query_plan: Option<QueryPlan<T, CM>>,
     ) -> error::Result<BodyResResultPrepared> {
         let flags = prepare_flags(with_tracing, with_warnings, beta_protocol);
 
         let envelope = Envelope::new_req_prepare(query.to_string(), keyspace, flags, self.version);
 
-        self.send_envelope(envelope, true, None, None, None, None, None, None)
+        let response = match query_plan {
+            Some(query_plan) => send_envelope(
+                query_plan.into_iter(),
+                &envelope,
+                true,
+                self.retry_policy.as_ref().new_session(),
+            )
             .await
+            .unwrap_or_else(|| Err("No response for prepare!".into())),
+            None => {
+                self.send_envelope(envelope, true, None, None, None, None, None, None)
+                    .await
+            }
+        };
+        response
             .and_then(|response| response.response_body())
             .and_then(convert_to_prepared)
     }
@@ -433,7 +439,8 @@ impl<
     /// Returns the raw prepared query result.
     #[inline]
     pub async fn prepare_raw<Q: ToString>(&self, query: Q) -> error::Result<BodyResResultPrepared> {
-        self.prepare_raw_tw(query, None, false, false, false).await
+        self.prepare_raw_tw(query, None, false, false, false, None)
+            .await
     }
 
     /// Prepares a query for execution. Along with query itself,
@@ -447,90 +454,36 @@ impl<
         with_tracing: bool,
         with_warnings: bool,
         beta_protocol: bool,
+        query_plan: Option<QueryPlan<T, CM>>,
     ) -> error::Result<PreparedQuery> {
         let s = query.to_string();
-        self.prepare_raw_tw(query, keyspace, with_tracing, with_warnings, beta_protocol)
-            .await
-            .map(|result| PreparedQuery {
-                id: result.id,
-                query: s,
-                keyspace: result
-                    .metadata
-                    .global_table_spec
-                    .map(|TableSpec { ks_name, .. }| ks_name),
-                pk_indexes: result.metadata.pk_indexes,
-                result_metadata_id: ArcSwapOption::new(result.result_metadata_id.map(Arc::new)),
-            })
+        self.prepare_raw_tw(
+            query,
+            keyspace,
+            with_tracing,
+            with_warnings,
+            beta_protocol,
+            query_plan,
+        )
+        .await
+        .map(|result| PreparedQuery {
+            id: result.id,
+            query: s,
+            keyspace: result
+                .metadata
+                .global_table_spec
+                .map(|TableSpec { ks_name, .. }| ks_name),
+            pk_indexes: result.metadata.pk_indexes,
+            result_metadata_id: ArcSwapOption::new(result.result_metadata_id.map(Arc::new)),
+        })
     }
 
     /// It prepares query without additional tracing information and warnings.
     /// Returns the prepared query.
     #[inline]
     pub async fn prepare<Q: ToString>(&self, query: Q) -> error::Result<PreparedQuery> {
-        self.prepare_tw(query, None, false, false, false).await
-    }
-
-    /// Prepare given CQL on all known nodes. Returns vector of results per node address.
-    /// This is useful when the user wants to ensure prepared statement exists on every node
-    /// (for example before batching prepared ids across nodes).
-    pub async fn prepare_on_all_nodes<Q: ToString>(
-        &self,
-        query: Q,
-        keyspace: Option<String>,
-    ) -> error::Result<PreparedQuery> {
-        let flags = prepare_flags(false, false, false);
-        let envelope = Envelope::new_req_prepare(query.to_string(), keyspace, flags, self.version);
-
-        // collect unignored nodes
-        let nodes = self.cluster_metadata_manager.metadata().unignored_nodes();
-
-        let mut first_error = None;
-        let mut prepared_query = None;
-        for node in nodes {
-            let addr = node.broadcast_rpc_address();
-
-            let res = send_envelope(
-                [node].iter().cloned(),
-                &envelope,
-                true,
-                self.retry_policy.as_ref().new_session(),
-            )
+        self.prepare_tw(query, None, false, false, false, None)
             .await
-            .unwrap_or_else(|| Err("No response for prepare on node".into()))
-            .and_then(|response| response.response_body())
-            .and_then(convert_to_prepared);
-            match res {
-                Ok(prepared_res) => {
-                    debug!("Prepared statement on node {}", addr);
-                    if prepared_query.is_none() {
-                        prepared_query = Some(PreparedQuery {
-                            id: prepared_res.id,
-                            query: query.to_string(),
-                            keyspace: prepared_res
-                                .metadata
-                                .global_table_spec
-                                .map(|TableSpec { ks_name, .. }| ks_name),
-                            pk_indexes: prepared_res.metadata.pk_indexes,
-                            result_metadata_id: ArcSwapOption::new(
-                                prepared_res.result_metadata_id.map(Arc::new),
-                            ),
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to prepare statement on node {}: {}", addr, e);
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => prepared_query.ok_or_else(|| {
-                error::Error::from("No nodes available to prepare the statement on!")
-            }),
-        }
     }
 
     /// Executes batch query.
